@@ -1,0 +1,128 @@
+```{r}
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(survival))
+suppressPackageStartupMessages(library(mets))
+suppressPackageStartupMessages(library(plyr))
+suppressPackageStartupMessages(library(rhdf5))
+```
+
+```{r}
+reformat_pk_id <- function(x) paste("pk_", x, sep="") # function to add pk_ prefix to pk local_Labs
+```
+
+```{r}
+mtb_dt <- fread(file="FRrLCposDedupnormtrim_inSampFilt_Imputed.csv",
+                header=TRUE)
+dim(mtb_dt)
+```
+
+```{r}
+mtb_list <- sapply(colnames(mtb_dt)[-1], function(x) reformat_pk_id(x))
+colnames(mtb_dt) <- c(colnames(mtb_dt)[1], mtb_list)
+```
+
+```{r}
+subjectID = "PLASMA_ID"
+mtb_dt = mtb_dt[,c(subjectID, mtb_list), with=F] 
+dim(mtb_dt)
+```
+
+```{r}
+pheno_dt = fread('FR2016Update_FR02_FR07_combined_pheno.csv')
+```
+
+```{r}
+basic_covariates = c("BL_AGE","MEN","BMI")
+extra_covariates = c('FR02_INS_0H', 'FR02_GLUK_120', 'FR02_GLUK_NOLLA', 'HBA1C')
+event = 'DIAB_T2'
+time = 'DIAB_T2_AGEDIFF'
+outcome = 'T2D'
+```
+
+```{r}
+# merge data
+pheno_cols = c(subjectID, basic_covariates, extra_covariates, event, time, 'PAASTO')
+mtb_dt = merge(pheno_dt[, pheno_cols, with=F], mtb_dt, by=subjectID)
+```
+
+```{r}
+mtb_dt_commonsub <- mtb_dt[complete.cases(mtb_dt[ , 
+                            c("BL_AGE", "MEN", "BMI", 'FR02_INS_0H', 'FR02_GLUK_120', 'FR02_GLUK_NOLLA', 'HBA1C')]), ]
+dim(mtb_dt_commonsub)
+```
+
+```{r}
+# cap upper outliers
+cap_upper_outliers_scale <- function(x) {
+  iqr = IQR(x, na.rm=T)
+  qnt_upper <- quantile(x, probs=c(.75), na.rm=T)
+  cap_upper <- quantile(x, probs=c(.999), na.rm=T)
+  x[x > (qnt_upper + 4*iqr)] <- cap_upper
+  x <- scale(x) # Z-score mtb values
+  return(x)}
+```
+
+```{r}
+# Cox regression function on event time
+cox_regression_func <- function(dt, event, time, covariates, mtb_var) { 
+    # function to run Cox regression for single mtb feature
+  dt[[mtb_var]] <- cap_upper_outliers_scale(dt[[mtb_var]])
+  dt <- dt[complete.cases(dt)] 
+    # remove rows with missing values in any column of data frame; 
+  if (nrow(dt[dt[[event]] == 1]) > N_event_thresh ) { 
+    # if enough cases; cases are marked by 1 in pheno_dt event column
+    f <- paste(paste("Surv(",time,", ",event,")",sep=""), "~", paste(c(covariates, mtb_var), collapse=" + ")) 
+      # make regression formula
+    mod = coxph(as.formula(f), data=dt)
+    mod_sum = summary(mod)
+    
+    # make table from coxph() output
+    frame <- data.table(
+      metabolite = mtb_var,
+      pvalue = mod_sum$coefficients[mtb_var,'Pr(>|z|)'],
+      hr = mod_sum$coefficients[mtb_var, 'exp(coef)'],
+      hr_lowerCI = mod_sum$conf.int[mtb_var, 'lower .95'],
+      hr_upperCI = mod_sum$conf.int[mtb_var, 'upper .95'],
+      beta = mod_sum$coefficients[mtb_var,'coef'],
+      se = mod_sum$coefficients[mtb_var,'se(coef)'],
+      z = mod_sum$coefficients[mtb_var,'z'])
+    
+    # add results for covars
+    for (covar in covariates) {
+      frame[ , (paste(covar, 'pvalue', sep='_')) := mod_sum$coefficients[covar,'Pr(>|z|)']]
+      frame[ , (paste(covar, 'hr', sep='_')) := mod_sum$coefficients[covar,'exp(coef)']]
+      frame[ , (paste(covar, 'hr_lowerCI', sep='_')) := mod_sum$conf.int[covar,'lower .95']]
+      frame[ , (paste(covar, 'hr_upperCI', sep='_')) := mod_sum$conf.int[covar,'upper .95']]
+      frame[ , (paste(covar, 'beta', sep='_')) := mod_sum$coefficients[covar,'coef']]
+      frame[ , (paste(covar, 'se', sep='_')) := mod_sum$coefficients[covar,'se(coef)']]
+      frame[ , (paste(covar, 'z', sep='_')) := mod_sum$coefficients[covar,'z']]
+    }
+    frame[ , 'n_total' := mod_sum$n]
+    frame[ , 'n_event' := mod_sum$nevent]    
+  }
+    return(frame)
+}
+```
+
+```{r}
+mtbs_of_interest_cox_basic_dt <- fread(file="FRrLCposDedupnormtrim_CoxRegT2Dincident_Basic_MtbsOfInterest.csv",
+                header=TRUE)
+dim(mtbs_of_interest_cox_basic_dt)
+```
+
+```{r}
+start_time <- Sys.time()
+
+for (i in extra_covariates) {
+  covars = c(basic_covariates,i)
+  cox_res_dt <- ldply(mtbs_of_interest_cox_basic_dt$local_Lab, function(mtb_var)
+  	      cox_regression_func(mtb_dt[mtb_dt[[time]] >= 0, c(event, time, covars, mtb_var),with=F], event=event, time=time, 
+  	                          covariates=covars, mtb_var=mtb_var)) 
+  setorder(cox_res_dt, pvalue) # sort by pvalue
+  cox_res_dt$.id <- NULL # remove this column
+  fwrite(cox_res_dt, paste('CoxBasicPlus', i, '_forPksOfInterest.csv', sep=''))
+  }
+
+print(round((Sys.time() - start_time), 2))
+```
+

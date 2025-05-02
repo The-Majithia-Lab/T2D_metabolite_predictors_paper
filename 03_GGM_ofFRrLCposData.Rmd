@@ -1,0 +1,64 @@
+```{r}
+library(GeneNet)
+install.packages("BiocManager")
+BiocManager::install("rhdf5")
+library(rhdf5)
+library(data.table)
+```
+
+```{r}
+save_dir = '..//Data//Processed//GGM//'
+time_stamp <- function() {
+  return(paste(substr(format(Sys.time(), "%Y%m%d%H%M"), start = 3, stop = nchar(format(Sys.time(), "%Y%m%d%H%M"))), '_', sep=''))}
+```
+
+```{r}
+# load mtb intensity data saved as hf
+start_time <- Sys.time()
+mtb_data_h5 <- h5read(file="FRrLCposDedupnormtrim_StrictFiltAndArjanaDedupAllT2Dpks_ImputLogScaled.h5",
+                             name="mtb_pos_df_inSampIntIsoAddFiltImpLogScaled")
+print(round((Sys.time() - start_time), 2))
+```
+
+```{r}
+mtb_matrix <- t(mtb_data_h5[["block0_values"]])
+dim(mtb_matrix) # check that 8014x14582 (samples x mtb)
+```
+
+```{r}
+# estimate partial correlation matrix
+start_time <- Sys.time()
+pcorr_matrix <- ggm.estimate.pcor(mtb_matrix) # input: data matrix (each rows corresponds to one multivariate observation)
+print(round((Sys.time() - start_time), 2))
+dim(pcorr_matrix) 
+```
+
+```{r}
+# get p-values, q-values and posterior probabilities for each potential edge; makes edge list / full network
+start_time <- Sys.time()
+directed_pcorr_stats <-network.test.edges(pcorr_matrix, plot=TRUE, direct=TRUE) 
+print(round((Sys.time() - start_time), 2))
+dim(directed_pcorr_stats) # check that 105349870 entries (14516 choose 2), all unique correlation values)
+```
+
+```{r}
+# save stats / edge list / full network
+start_time <- Sys.time()
+h5write(directed_pcorr_stats, paste(save_dir, time_stamp(), 'processedFRrLCpos_GgmStats.h5', sep=''), "directed_pcorr_stats")
+print(round((Sys.time() - start_time), 2))
+```
+
+```{r}
+# extract final network containing edges with prob > 0.9 (i.e. local fdr < 0.1)
+start_time <- Sys.time()
+directed_ntw <-extract.network(directed_pcorr_stats, cutoff.ggm=0.9)
+print(round((Sys.time() - start_time), 2))
+dim(directed_ntw)
+```
+
+```{r}
+# save trimmed stats / trimmed edge list / final network
+start_time <- Sys.time()
+write.csv(directed_ntw, paste(save_dir, time_stamp(), 'processedFRrLCpos_GgmP09Edges.csv', sep=''), row.names = FALSE)
+print(round((Sys.time() - start_time), 2))
+```

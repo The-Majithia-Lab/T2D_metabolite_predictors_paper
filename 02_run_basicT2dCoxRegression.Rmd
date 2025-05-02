@@ -1,0 +1,210 @@
+```{r}
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(survival))
+suppressPackageStartupMessages(library(mets))
+suppressPackageStartupMessages(library(plyr))
+suppressPackageStartupMessages(library(rhdf5))
+
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(survminer))
+suppressPackageStartupMessages(library(rms))
+suppressPackageStartupMessages(library(svglite))
+```
+
+```{r}
+# function to add pk_ prefix to pk local_Labs
+reformat_pk_id <- function(x) paste("pk_", as.character(as.integer(x)), sep="")
+```
+
+```{r}
+mtb_dt <- fread(file="FRrLCposDedupnormtrim_inSampFilt_Imputed.csv", header=TRUE)
+dim(mtb_dt)
+```
+
+```{r}
+mtb_des_dt = fread('FR_rLC_pos_dedupnormtrim.description.csv')
+dim(mtb_des_dt)
+```
+
+```{r}
+mtb_list <- sapply(colnames(mtb_dt)[-1], function(x) reformat_pk_id(x))
+colnames(mtb_dt) <- c(colnames(mtb_dt)[1], mtb_list)
+```
+
+```{r}
+subjectID = "PLASMA_ID"
+mtb_dt = mtb_dt[,c(subjectID, mtb_list), with=F] # select only subjectID & mtb_list columns 
+dim(mtb_dt)
+```
+
+```{r}
+pheno_dt = fread('FR2016Update_FR02_FR07_combined_pheno.csv')
+```
+
+```{r}
+basic_covariates = c("BL_AGE","MEN","BMI")
+event = 'DIAB_T2'
+time = 'DIAB_T2_AGEDIFF'
+outcome = 'T2D'
+N_event_thresh = 10
+```
+
+```{r}
+mtb_des_dt$local_Lab <- sapply(mtb_des_dt$local_Lab, function(x) reformat_pk_id(x))
+```
+
+```{r}
+# merge data
+pheno_cols = c(subjectID, basic_covariates, event, time, 'PAASTO', 'FR02_GLUK_NOLLA')
+mtb_dt = merge(pheno_dt[, pheno_cols, with=F], mtb_dt, by=subjectID)
+```
+
+```{r}
+# cap upper outliers
+cap_upper_outliers_scale <- function(x) {
+  iqr = IQR(x, na.rm=T)
+  qnt_upper <- quantile(x, probs=c(.75), na.rm=T)
+  cap_upper <- quantile(x, probs=c(.999), na.rm=T)
+  x[x > (qnt_upper + 4*iqr)] <- cap_upper
+  x <- scale(x) # Z-score mtb values
+  return(x)
+}
+```
+
+```{r}
+# Cox regression function on event time
+cox_regression_func <- function(dt, event, time, covariates, mtb_var) { 
+    # function to run Cox regression for single mtb feature
+  dt[[mtb_var]] <- cap_upper_outliers_scale(dt[[mtb_var]])
+  dt <- dt[complete.cases(dt)] 
+    # remove rows with missing values in any column of data frame 
+  if (nrow(dt[dt[[event]] == 1]) > N_event_thresh ) { 
+    # if enough cases; cases are marked by 1 in pheno_dt event column
+    f <- paste(paste("Surv(",time,", ",event,")",sep=""), "~", paste(c(covariates, mtb_var), collapse=" + ")) 
+      # make regression formula
+    mod = coxph(as.formula(f), data=dt)
+    mod_sum = summary(mod)
+    
+    # make table from coxph() output
+    frame <- data.table(
+      metabolite = mtb_var,
+      pvalue = mod_sum$coefficients[mtb_var,'Pr(>|z|)'],
+      hr = mod_sum$coefficients[mtb_var, 'exp(coef)'],
+      # mod_sum$coefficients & conf.int 'exp(coef)' are same values
+      hr_lowerCI = mod_sum$conf.int[mtb_var, 'lower .95'],
+      hr_upperCI = mod_sum$conf.int[mtb_var, 'upper .95'],
+      beta = mod_sum$coefficients[mtb_var,'coef'],
+      se = mod_sum$coefficients[mtb_var,'se(coef)'],
+      z = mod_sum$coefficients[mtb_var,'z'])
+    
+    # add results for covars
+    for (covar in covariates) {
+      frame[ , (paste(covar, 'pvalue', sep='_')) := mod_sum$coefficients[covar,'Pr(>|z|)']]
+      frame[ , (paste(covar, 'hr', sep='_')) := mod_sum$coefficients[covar,'exp(coef)']]
+      frame[ , (paste(covar, 'hr_lowerCI', sep='_')) := mod_sum$conf.int[covar,'lower .95']]
+      frame[ , (paste(covar, 'hr_upperCI', sep='_')) := mod_sum$conf.int[covar,'upper .95']]
+      frame[ , (paste(covar, 'beta', sep='_')) := mod_sum$coefficients[covar,'coef']]
+      frame[ , (paste(covar, 'se', sep='_')) := mod_sum$coefficients[covar,'se(coef)']]
+      frame[ , (paste(covar, 'z', sep='_')) := mod_sum$coefficients[covar,'z']]
+    }
+    frame[ , 'n_total' := mod_sum$n]
+    frame[ , 'n_event' := mod_sum$nevent]    
+  }
+    return(frame)
+}
+```
+
+```{r}
+# run Cox regression 
+start_time <- Sys.time()
+
+cox_res_dt <- ldply(mtb_list, function(mtb_var)
+	 cox_regression_func(mtb_dt[mtb_dt[[time]] >= 0, c(event, time, basic_covariates, mtb_var),with=F], event=event, time=time, 
+	     covariates=basic_covariates, mtb_var=mtb_var), .parallel = FALSE) 
+cox_res_dt = merge(mtb_des_dt[,.(local_Lab, MZ, RT)], cox_res_dt, by.x="local_Lab", by.y="metabolite") # add mtb metadata to output
+cox_res_dt = cox_res_dt[order(pvalue)] # sort by pvalue
+cox_res_dt$.id <- NULL # remove this column
+fwrite(cox_res_dt, 'FRrLCposDedupnormtrim_CoxRegT2Dincident_Basic.csv')
+
+print(round((Sys.time() - start_time), 2))
+```
+
+```{r}
+# plot KP curves
+
+# prepare data for KP plot
+km_dt_pk2858818 = mtb_dt[mtb_dt[[time]] >= 0, c(event, time, basic_covariates, 'pk_2858818'), with=F]
+km_dt_pk2858818 <- km_dt_pk2858818[complete.cases(km_dt_pk2858818)]
+dim(km_dt_pk2858818)
+
+# create top vs bottom 25% mtb level sample categories
+bottom25_pk2858818 <- unname(quantile(km_dt_pk2858818[['pk_2858818']], probs = 0.25, na.rm = TRUE))
+top25_pk2858818 <- unname(quantile(km_dt_pk2858818[['pk_2858818']], probs = 0.75, na.rm = TRUE))
+print(bottom25_pk2858818)
+print(top25_pk2858818)
+km_dt_topbottom25_pk2858818 <- km_dt_pk2858818[(km_dt_pk2858818[['pk_2858818']] <= bottom25_pk2858818) | 
+                                               (km_dt_pk2858818[['pk_2858818']] >= top25_pk2858818)]
+print(dim(km_dt_pk2858818)[1]/2)
+print(dim(km_dt_topbottom25_pk2858818)[1]) # check if dim makes sense
+km_dt_topbottom25_pk2858818[km_dt_topbottom25_pk2858818[['pk_2858818']] <= bottom25_pk2858818, 
+                          quart_var_pk2858818 := "First_Quartile_pk2858818"]
+km_dt_topbottom25_pk2858818[km_dt_topbottom25_pk2858818[['pk_2858818']] >= top25_pk2858818, 
+                          quart_var_pk2858818 := "Fourth_Quartile_pk2858818"]
+
+km_dt_topbottom25_pk2858818$quart_var_pk2858818 <- factor(km_dt_topbottom25_pk2858818$quart_var_pk2858818, 
+                                                      levels=c('Fourth_Quartile_pk2858818', 'First_Quartile_pk2858818'))
+
+km_mod_pk2858818 <- survfit(as.formula("Surv(DIAB_T2_AGEDIFF, DIAB_T2) ~ quart_var_pk2858818"), data=km_dt_topbottom25_pk2858818, type="kaplan-meier")
+
+km_plot_pk2858818 <- ggsurvplot(fit = km_mod_pk2858818, pval = TRUE, conf.int =TRUE, palette=c("sienna", "azure4"), 
+                              censor.size = 2.5, censor.shape = "|", 
+                              legend.labs=c("Upper Quartile", "Lower Quartile"), 
+                              xlab = "Time (years)", ylab = "T2D-free Survival Probability", legend.title = "m/z 617.5127", 
+                              risk.table = TRUE, risk.table.height=.3, risk.table.fontsize=4, pval.coord = c(0,0.85),
+                              ylim = c(0.8, 1), ggtheme = theme_classic2(base_size=24))
+km_plot_pk2858818$plot
+
+# save it
+ggsave(file = paste0("KPcurve_basic_pk2858818.png"), path = '', km_plot_pk2858818$plot,
+       device = "png", units = "cm", width = 20, height = 20, dpi=1200) # only saves plot not risk table
+```
+
+```{r}
+# plot KP curves
+
+# prepare data for KP plot
+km_dt_pk3096307 = mtb_dt[mtb_dt[[time]] >= 0, c(event, time, basic_covariates, 'pk_3096307'), with=F]
+km_dt_pk3096307 <- km_dt_pk3096307[complete.cases(km_dt_pk3096307)]
+dim(km_dt_pk3096307)
+
+# create top vs bottom 25% mtb level sample categories
+bottom25_pk3096307 <- unname(quantile(km_dt_pk3096307[['pk_3096307']], probs = 0.25, na.rm = TRUE))
+top25_pk3096307 <- unname(quantile(km_dt_pk3096307[['pk_3096307']], probs = 0.75, na.rm = TRUE))
+print(bottom25_pk3096307)
+print(top25_pk3096307)
+km_dt_topbottom25_pk3096307 <- km_dt_pk3096307[(km_dt_pk3096307[['pk_3096307']] <= bottom25_pk3096307) | 
+                                               (km_dt_pk3096307[['pk_3096307']] >= top25_pk3096307)]
+print(dim(km_dt_pk3096307)[1]/2)
+print(dim(km_dt_topbottom25_pk3096307)[1]) # check if dim makes sense
+km_dt_topbottom25_pk3096307[km_dt_topbottom25_pk3096307[['pk_3096307']] <= bottom25_pk3096307, 
+                          quart_var_pk3096307 := "First_Quartile_pk3096307"]
+km_dt_topbottom25_pk3096307[km_dt_topbottom25_pk3096307[['pk_3096307']] >= top25_pk3096307, 
+                          quart_var_pk3096307 := "Fourth_Quartile_pk3096307"]
+
+km_dt_topbottom25_pk3096307$quart_var_pk3096307 <- factor(km_dt_topbottom25_pk3096307$quart_var_pk3096307, 
+                                                      levels=c('Fourth_Quartile_pk3096307', 'First_Quartile_pk3096307'))
+
+km_mod_pk3096307 <- survfit(as.formula("Surv(DIAB_T2_AGEDIFF, DIAB_T2) ~ quart_var_pk3096307"), data=km_dt_topbottom25_pk3096307, type="kaplan-meier")
+
+km_plot_pk3096307 <- ggsurvplot(fit = km_mod_pk3096307, pval = TRUE, conf.int =TRUE, palette=c("sienna", "azure4"), 
+                              censor.size = 2.5, censor.shape = "|", 
+                              legend.labs=c("Upper Quartile", "Lower Quartile"), 
+                              xlab = "Time (years)", ylab = "T2D-free Survival Probability", legend.title = "m/z 849.6553", 
+                              risk.table = TRUE, risk.table.height=.3, risk.table.fontsize=4, pval.coord = c(0,0.85),
+                              ylim = c(0.8, 1), ggtheme = theme_classic2(base_size=24))
+km_plot_pk3096307$plot
+
+# save it
+ggsave(file = paste0("KPcurve_basic_pk3096307.png"), path = '', km_plot_pk3096307$plot,
+       device = "png", units = "cm", width = 20, height = 20, dpi=1200) # only saves plot not risk table
+```

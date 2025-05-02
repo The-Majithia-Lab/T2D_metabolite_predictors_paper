@@ -1,0 +1,120 @@
+```{r}
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(survival))
+suppressPackageStartupMessages(library(mets))
+suppressPackageStartupMessages(library(plyr))
+suppressPackageStartupMessages(library(rhdf5))
+```
+
+```{r}
+reformat_pk_id <- function(x) paste("pk_", as.character(x), sep="")
+# function to add pk_ prefix to pk local_Labs
+```
+
+```{r}
+mtb_dt <- fread(file="ARrLCpos64FrPksOfInterest_plusRelevantPT_for7562samples.csv", header=TRUE)
+dim(mtb_dt)
+```
+
+```{r}
+mtb_list <- sapply(colnames(mtb_dt)[11:(length(colnames(mtb_dt))-2)], function(x) reformat_pk_id(x))
+colnames(mtb_dt) <- c('ID_C_x', 'ID', 'age', 'sex', 'sex_01', 'BMI', 'race', 't2d_inc', 't2d_inc_time', 'SampleID', mtb_list, "ID_C_y", "FTRB05")
+# for sex 1 is F
+```
+
+```{r}
+unique(mtb_dt[['race']])
+any(is.nan(mtb_dt[['race']]))
+mtb_dt$race <- factor(mtb_dt$race, levels=c("W", "B"))
+```
+
+```{r}
+basic_covariates = c("age","sex_01","BMI")
+event = 't2d_inc'
+time = 't2d_inc_time'
+outcome = 'T2D'
+```
+
+```{r}
+# cap upper outliers 
+cap_upper_outliers_scale <- function(x, scale=TRUE) {
+  iqr = IQR(x, na.rm=T)
+  qnt_upper <- quantile(x, probs=c(.75), na.rm=T)
+  cap_upper <- quantile(x, probs=c(.999), na.rm=T)
+  x[x > (qnt_upper + 4*iqr)] <- cap_upper
+  if (scale) {
+    x <- scale(x) # Z-score mtb values
+  }
+  return(x)
+}
+```
+
+```{r}
+# Cox regression function on event time, including race stratification interaction
+cox_regression_raceint_func <- function(dt, event, time, covariates, mtb_var, return_model=FALSE, scale_mtb=TRUE) { 
+  # function to run Cox regression for single mtb feature
+  dt[[mtb_var]] <- cap_upper_outliers_scale(dt[[mtb_var]], scale=scale_mtb)
+  dt <- dt[complete.cases(dt)] 
+    # remove rows with missing values in any column of data frame; 
+
+  f <- paste(paste("Surv(",time,", ",event,")",sep=""), "~", paste(c(covariates, 
+     paste(mtb_var, 'strata(race)', sep='*')), collapse=" + ")) # A*B = A + B + A:B 
+  mod = coxph(as.formula(f), data=dt)
+
+  if (return_model) {
+    return(mod)
+  }
+  
+  else{
+    mod_sum = summary(mod)
+  
+    # make table from coxph() output
+    frame <- data.table(
+      metabolite = mtb_var,
+      pvalue = mod_sum$coefficients[mtb_var,'Pr(>|z|)'],
+      hr = mod_sum$coefficients[mtb_var, 'exp(coef)'],
+      hr_lowerCI = mod_sum$conf.int[mtb_var, 'lower .95'],
+      hr_upperCI = mod_sum$conf.int[mtb_var, 'upper .95'],
+      beta = mod_sum$coefficients[mtb_var,'coef'],
+      se = mod_sum$coefficients[mtb_var,'se(coef)'],
+      z = mod_sum$coefficients[mtb_var,'z'])
+    
+    # add results for covars
+    for (covar in covariates) {
+      frame[ , (paste(covar, 'pvalue', sep='_')) := mod_sum$coefficients[covar,'Pr(>|z|)']]
+      frame[ , (paste(covar, 'hr', sep='_')) := mod_sum$coefficients[covar,'exp(coef)']]
+      frame[ , (paste(covar, 'hr_lowerCI', sep='_')) := mod_sum$conf.int[covar,'lower .95']]
+      frame[ , (paste(covar, 'hr_upperCI', sep='_')) := mod_sum$conf.int[covar,'upper .95']]
+      frame[ , (paste(covar, 'beta', sep='_')) := mod_sum$coefficients[covar,'coef']]
+      frame[ , (paste(covar, 'se', sep='_')) := mod_sum$coefficients[covar,'se(coef)']]
+      frame[ , (paste(covar, 'z', sep='_')) := mod_sum$coefficients[covar,'z']]
+    }
+    
+    # add mtb-race interaction results
+    s = paste(mtb_var, 'strata(race)B', sep=':')
+    frame[ , 'mtb_stratarace_interaction_pvalue' := mod_sum$coefficients[s,'Pr(>|z|)']]
+    frame[ , 'mtb_stratarace_interaction_hr' := mod_sum$coefficients[s,'exp(coef)']]
+    frame[ , 'mtb_stratarace_interaction_hr_lowerCI' := mod_sum$conf.int[s,'lower .95']]
+    frame[ , 'mtb_stratarace_interaction_hr_upperCI' := mod_sum$conf.int[s,'upper .95']]
+    frame[ , 'mtb_stratarace_interaction_beta' := mod_sum$coefficients[s,'coef']]
+    frame[ , 'mtb_stratarace_interaction_se' := mod_sum$coefficients[s,'se(coef)']]
+    frame[ , 'mtb_stratarace_interaction_z' := mod_sum$coefficients[s,'z']]
+    
+    frame[ , 'n_total' := mod_sum$n]
+    frame[ , 'n_event' := mod_sum$nevent]    
+    
+    return(frame)
+  }
+}
+```
+
+```{r}
+# basic + strata(race) + mtb*strata(race)
+cox_res_dt <- ldply(mtb_list, function(mtb_var)
+	      cox_regression_raceint_func_raw(mtb_dt, event=event, time=time, covariates=basic_covariates,
+	                                      mtb_var=mtb_var))
+cox_res_dt$.id <- NULL
+setorder(cox_res_dt, pvalue)
+fwrite(cox_res_dt, '..//Data//Processed//AricRaceCoxRegressions//RaceAsStrata//ARrLCpos64FrPksOfInterest_CoxT2Dinc_BasicPlusStrataRaceInteractionRawVals_on7562Samples.csv')
+```
+
